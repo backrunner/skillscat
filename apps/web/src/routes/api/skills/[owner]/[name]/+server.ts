@@ -5,7 +5,16 @@ import { getCached } from '$lib/server/cache';
 import { getAuthContext } from '$lib/server/middleware/auth';
 import { isSkillOwner } from '$lib/server/permissions';
 
+/**
+ * GET /api/skills/[owner]/[name] - Get skill by owner and name
+ *
+ * This is the two-segment path version that produces clean URLs like:
+ * /api/skills/testuser/my-skill instead of /api/skills/%40testuser%2Fmy-skill
+ */
 export const GET: RequestHandler = async ({ params, platform }) => {
+  const { owner, name } = params;
+  const slug = `${owner}/${name}`;
+
   try {
     const db = platform?.env?.DB;
 
@@ -17,9 +26,8 @@ export const GET: RequestHandler = async ({ params, platform }) => {
     }
 
     const { data, hit } = await getCached(
-      `api:skill:${params.slug}`,
+      `api:skill:${slug}`,
       async () => {
-        // Get skill by slug
         const row = await db.prepare(`
           SELECT
             s.id,
@@ -53,7 +61,7 @@ export const GET: RequestHandler = async ({ params, platform }) => {
           LEFT JOIN authors a ON s.repo_owner = a.username
           WHERE s.slug = ?
           GROUP BY s.id
-        `).bind(params.slug).first<{
+        `).bind(slug).first<{
           id: string;
           name: string;
           slug: string;
@@ -244,7 +252,7 @@ function buildR2Path(skill: SkillInfo): string {
 }
 
 /**
- * DELETE /api/skills/[slug] - Delete a private skill
+ * DELETE /api/skills/[owner]/[name] - Delete a private skill
  *
  * Only the owner can delete a skill, and only uploaded (private) skills can be deleted.
  * GitHub-sourced skills cannot be deleted through this endpoint.
@@ -263,10 +271,8 @@ export const DELETE: RequestHandler = async ({ locals, platform, request, params
     throw error(401, 'Authentication required');
   }
 
-  const { slug } = params;
-  if (!slug) {
-    throw error(400, 'Skill slug is required');
-  }
+  const { owner, name } = params;
+  const slug = `${owner}/${name}`;
 
   // Fetch skill by slug and verify ownership
   const skill = await db.prepare(`
