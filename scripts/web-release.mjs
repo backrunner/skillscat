@@ -7,41 +7,45 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 
-const INITIAL_VERSION = '0.1.0';
-const DEFAULT_TAG_PREFIX = 'cli/v';
+const INITIAL_VERSION = '0.0.1';
+const DEFAULT_TAG_PREFIX = 'web/v';
 const ALLOWED_BUMPS = new Set(['major', 'minor', 'patch']);
+const ALLOWED_WORKER_ENVS = new Set(['production', 'local']);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const projectRoot = resolve(__dirname, '..');
-const cliDir = resolve(projectRoot, 'apps/cli');
-const cliPackagePath = resolve(cliDir, 'package.json');
+const webDir = resolve(projectRoot, 'apps/web');
+const webPackagePath = resolve(webDir, 'package.json');
 
 function printUsage() {
   console.log(`
 Usage:
-  node scripts/cli-release.mjs build [--skip-test] [--dry-run]
-  node scripts/cli-release.mjs publish [--bump major|minor|patch] [--skip-test] [--dry-run] [--yes]
+  node scripts/web-release.mjs build [--dry-run]
+  node scripts/web-release.mjs deploy [--bump major|minor|patch] [--skip-build] [--dry-run] [--yes]
                                       [--no-tag] [--tag <tag>] [--push-tag]
+  node scripts/web-release.mjs deploy-all [--bump major|minor|patch] [--skip-build] [--dry-run] [--yes]
+                                          [--no-tag] [--tag <tag>] [--push-tag]
+                                          [--workers-env production|local]
 
 Examples:
-  node scripts/cli-release.mjs build
-  node scripts/cli-release.mjs publish --bump patch
-  node scripts/cli-release.mjs publish --bump minor --yes
-  node scripts/cli-release.mjs publish --no-tag
-  node scripts/cli-release.mjs publish --tag release/cli-v1.2.3 --push-tag
+  node scripts/web-release.mjs deploy --bump patch
+  node scripts/web-release.mjs deploy --no-tag
+  node scripts/web-release.mjs deploy-all --bump minor
+  node scripts/web-release.mjs deploy-all --dry-run
 `.trim());
 }
 
 function parseArgs(argv) {
   const options = {
-    skipTest: false,
-    dryRun: false,
     bump: null,
+    skipBuild: false,
+    dryRun: false,
     yes: false,
     noTag: false,
     tag: '',
-    pushTag: false
+    pushTag: false,
+    workersEnv: 'production'
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -49,8 +53,8 @@ function parseArgs(argv) {
 
     if (arg === '--') continue;
 
-    if (arg === '--skip-test') {
-      options.skipTest = true;
+    if (arg === '--skip-build') {
+      options.skipBuild = true;
       continue;
     }
     if (arg === '--dry-run') {
@@ -103,6 +107,23 @@ function parseArgs(argv) {
       options.tag = value;
       continue;
     }
+    if (arg === '--workers-env') {
+      const value = argv[i + 1];
+      if (!value || !ALLOWED_WORKER_ENVS.has(value)) {
+        throw new Error('--workers-env requires production | local');
+      }
+      options.workersEnv = value;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--workers-env=')) {
+      const value = arg.slice('--workers-env='.length);
+      if (!ALLOWED_WORKER_ENVS.has(value)) {
+        throw new Error('--workers-env requires production | local');
+      }
+      options.workersEnv = value;
+      continue;
+    }
 
     throw new Error(`Unknown argument: ${arg}`);
   }
@@ -110,7 +131,6 @@ function parseArgs(argv) {
   if (options.noTag && options.tag) {
     throw new Error('Cannot use --no-tag and --tag together');
   }
-
   if (options.noTag && options.pushTag) {
     throw new Error('Cannot use --push-tag with --no-tag');
   }
@@ -179,30 +199,30 @@ function runStep(label, command, args, options = {}) {
   };
 }
 
-function getCliVersion() {
-  const pkg = readJson(cliPackagePath);
+function getWebVersion() {
+  const pkg = readJson(webPackagePath);
   return pkg.version ?? INITIAL_VERSION;
 }
 
-function maybeBumpCliVersion(options) {
-  const pkg = readJson(cliPackagePath);
+function maybeBumpWebVersion(options) {
+  const pkg = readJson(webPackagePath);
   const currentVersion = pkg.version ?? INITIAL_VERSION;
   const nextVersion = options.bump ? bumpVersion(currentVersion, options.bump) : currentVersion;
 
-  console.log(`CLI version: ${currentVersion}${nextVersion !== currentVersion ? ` -> ${nextVersion}` : ''}`);
+  console.log(`Web version: ${currentVersion}${nextVersion !== currentVersion ? ` -> ${nextVersion}` : ''}`);
 
   if (!options.bump) {
     return { currentVersion, nextVersion };
   }
 
   if (options.dryRun) {
-    console.log('[version] Dry-run enabled, apps/cli/package.json will not be changed.');
+    console.log('[version] Dry-run enabled, apps/web/package.json will not be changed.');
     return { currentVersion, nextVersion };
   }
 
   pkg.version = nextVersion;
-  writeJson(cliPackagePath, pkg);
-  console.log(`[version] Updated apps/cli/package.json -> ${nextVersion}`);
+  writeJson(webPackagePath, pkg);
+  console.log(`[version] Updated apps/web/package.json -> ${nextVersion}`);
   return { currentVersion, nextVersion };
 }
 
@@ -215,9 +235,8 @@ function assertTagNotExists(tag, options) {
   if (!tag) return;
 
   const result = runStep('tag-check', 'git', ['tag', '-l', tag], {
-    cwd: projectRoot,
-    dryRun: options.dryRun,
-    capture: true
+    capture: true,
+    dryRun: options.dryRun
   });
 
   if (!options.dryRun && result.stdout.trim()) {
@@ -240,37 +259,51 @@ async function confirmOrExit(options, question) {
   }
 }
 
-function printPublishPlan(versionInfo, tag, options) {
-  console.log('\nRelease plan (CLI):');
+function printPlan(mode, versionInfo, tag, options) {
+  console.log(`\nRelease plan (Web: ${mode}):`);
   console.log(`- Version: ${versionInfo.currentVersion} -> ${versionInfo.nextVersion}`);
-  console.log(`- Test: ${options.skipTest ? 'skip' : 'run'}`);
-  console.log('- Build: run');
-  console.log('- Publish: npm publish --access public');
-  console.log(`- Tag: ${tag ? `create ${tag} (after publish)` : 'skip'}`);
+  console.log(`- Build web: ${options.skipBuild ? 'skip' : 'run'}`);
+  console.log('- Deploy web: run');
+  if (mode === 'deploy-all') {
+    console.log(`- Deploy workers: run (env: ${options.workersEnv})`);
+  }
+  console.log(`- Tag: ${tag ? `create ${tag} (after successful deploy)` : 'skip'}`);
   console.log(`- Push tag: ${options.pushTag ? 'yes' : 'no'}`);
   if (options.dryRun) {
     console.log('- Mode: dry-run');
   }
 }
 
-function runBuild(options) {
-  if (!options.skipTest) {
-    runStep('test', 'pnpm', ['--filter', './apps/cli', 'test'], {
-      cwd: projectRoot,
-      dryRun: options.dryRun
-    });
-  }
-
-  runStep('build', 'pnpm', ['--filter', './apps/cli', 'build'], {
+function runWebBuild(options) {
+  runStep('build:web', 'pnpm', ['--filter', '@skillscat/web', 'build'], {
     cwd: projectRoot,
     dryRun: options.dryRun
+  });
+}
+
+function runWebDeploy(options) {
+  runStep('deploy:web', 'pnpm', ['--filter', '@skillscat/web', 'run', 'deploy'], {
+    cwd: projectRoot,
+    dryRun: options.dryRun
+  });
+}
+
+function runWorkersDeploy(options) {
+  const args = ['scripts/deploy-workers.mjs', '--all', '--env', options.workersEnv];
+  if (options.dryRun) {
+    args.push('--dry-run');
+  }
+
+  runStep('deploy:workers', 'node', args, {
+    cwd: projectRoot,
+    dryRun: false
   });
 }
 
 function runTagFlow(tag, version, options) {
   if (!tag) return;
 
-  runStep('tag', 'git', ['tag', '-a', tag, '-m', `cli release v${version}`], {
+  runStep('tag', 'git', ['tag', '-a', tag, '-m', `web release v${version}`], {
     cwd: projectRoot,
     dryRun: options.dryRun
   });
@@ -283,22 +316,31 @@ function runTagFlow(tag, version, options) {
   }
 }
 
-async function runPublish(options) {
-  const versionInfo = maybeBumpCliVersion(options);
+async function runDeploy(command, options) {
+  const versionInfo = maybeBumpWebVersion(options);
   const tag = resolveTag(versionInfo.nextVersion, options);
 
   assertTagNotExists(tag, options);
-  printPublishPlan(versionInfo, tag, options);
-  await confirmOrExit(options, 'Continue CLI publish');
+  printPlan(command, versionInfo, tag, options);
+  await confirmOrExit(
+    options,
+    command === 'deploy-all'
+      ? 'Continue web + workers deploy'
+      : 'Continue web deploy'
+  );
 
-  runBuild(options);
-  runStep('publish', 'npm', ['publish', '--access', 'public'], {
-    cwd: cliDir,
-    dryRun: options.dryRun
-  });
+  if (!options.skipBuild) {
+    runWebBuild(options);
+  }
+
+  runWebDeploy(options);
+
+  if (command === 'deploy-all') {
+    runWorkersDeploy(options);
+  }
+
   runTagFlow(tag, versionInfo.nextVersion, options);
-
-  console.log('\nCLI publish flow completed.');
+  console.log(`\nWeb ${command} flow completed.`);
 }
 
 async function main() {
@@ -313,13 +355,18 @@ async function main() {
   const options = parseArgs(argv.slice(1));
 
   if (command === 'build') {
-    console.log(`CLI version: ${getCliVersion()}`);
-    runBuild(options);
+    console.log(`Web version: ${getWebVersion()}`);
+    runWebBuild(options);
     return;
   }
 
-  if (command === 'publish') {
-    await runPublish(options);
+  if (command === 'deploy') {
+    await runDeploy('deploy', options);
+    return;
+  }
+
+  if (command === 'deploy-all') {
+    await runDeploy('deploy-all', options);
     return;
   }
 
@@ -327,7 +374,7 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(`[cli-release] ${error.message}`);
+  console.error(`[web-release] ${error.message}`);
   printUsage();
   process.exit(1);
 });
